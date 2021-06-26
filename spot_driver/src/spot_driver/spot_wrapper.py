@@ -1,6 +1,11 @@
 import time
 import math
+import os
+import subprocess
 
+
+from bosdyn.client import create_standard_sdk, RpcError, ResponseError
+from bosdyn.client.exceptions import UnauthenticatedError
 from bosdyn.client import create_standard_sdk, ResponseError, RpcError
 from bosdyn.client.async_tasks import AsyncPeriodicQuery, AsyncTasks
 from bosdyn.geometry import EulerZXY
@@ -22,6 +27,11 @@ from bosdyn.client import frame_helpers
 from bosdyn.client import math_helpers
 from bosdyn.client.exceptions import InternalServerError
 
+import bosdyn.api.spot.robot_command_pb2 as spot_command_pb2
+import bosdyn.client
+import bosdyn.client.util
+from bosdyn.choreography.client.choreography import ChoreographyClient, load_choreography_sequence_from_txt_file
+
 from . import graph_nav_util
 
 import bosdyn.api.robot_state_pb2 as robot_state_proto
@@ -34,6 +44,39 @@ side_image_sources = ['left_fisheye_image', 'right_fisheye_image', 'left_depth',
 """List of image sources for side image periodic query"""
 rear_image_sources = ['back_fisheye_image', 'back_depth']
 """List of image sources for rear image periodic query"""
+
+
+
+# --------- Added by Yejin. Refer to xbox_controller.py ------
+VELOCITY_BASE_SPEED = 0.5  # m/s
+VELOCITY_BASE_ANGULAR = 0.8  # rad/sec
+VELOCITY_CMD_DURATION = 0.6  # seconds
+HEIGHT_MAX = 0.3  # m
+ROLL_OFFSET_MAX = 0.4  # rad
+YAW_OFFSET_MAX = 0.7805  # rad
+PITCH_OFFSET_MAX = 0.7805  # rad
+HEIGHT_CHANGE = 0.1  # m per command
+
+
+ROSBAG_PATH = "/home/yejinkim/repo/ROBOT_PROJECTS/ros2_ws/motions"
+ROSBAG_DANCE = {2:"1_rear_bow",
+                3:"2_front_bow",
+                4:"3_corners",
+                5:"4_fall_left",
+                6:"5_fall_right",
+                7:"6_updown",
+                8:"7_dance",
+                9:"8_pet",
+                10:"9_random"}
+CHOREO_PATH = "/home/yejinkim/repo/ROBOT_PROJECTS/SPOT"
+CHOREO_DANCE = {1:"sway_start.csq",
+                11:"turn_90.csq",
+                12:"walk_4m.csq",
+                13:"turn_180.csq",
+                14:"walk_turn_all.csq",
+                15:"ending.csq"}
+
+
 
 class AsyncRobotState(AsyncPeriodicQuery):
     """Class to get robot state at regular intervals.  get_robot_state_async query sent to the robot at every tick.  Callback registered to defined callback function.
@@ -62,7 +105,7 @@ class AsyncMetrics(AsyncPeriodicQuery):
 
         Attributes:
             client: The Client to a service on the robot
-            logger: Logger object
+            logger: Logger objspot_command_pb2ect
             rate: Rate (Hz) to trigger the query
             callback: Callback function to call when the results of the query are available
     """
@@ -212,6 +255,10 @@ class SpotWrapper():
         self._keep_alive = True
         self._valid = True
 
+        self._mode = None
+        self._body_height = 0
+        self._Count_DANCE = 1
+
         self._mobility_params = RobotCommandBuilder.mobility_params()
         self._is_standing = False
         self._is_sitting = True
@@ -236,6 +283,7 @@ class SpotWrapper():
 
         try:
             self._sdk = create_standard_sdk('ros_spot')
+            self._sdk.register_service_client(ChoreographyClient)
         except Exception as e:
             self._logger.error("Error creating SDK object: %s", e)
             self._valid = False
@@ -260,8 +308,17 @@ class SpotWrapper():
                 self._power_client = self._robot.ensure_client(PowerClient.default_service_name)
                 self._lease_client = self._robot.ensure_client(LeaseClient.default_service_name)
                 self._lease_wallet = self._lease_client.lease_wallet
+                
+                print(self._lease_client.list_leases())
+
+                #lease = self._lease_client.acquire()
+                #lk = LeaseKeepAlive(self._lease_client)
                 self._image_client = self._robot.ensure_client(ImageClient.default_service_name)
                 self._estop_client = self._robot.ensure_client(EstopClient.default_service_name)
+
+                # Create the client for the Choreography service.
+                self._choreography_client = self._robot.ensure_client(ChoreographyClient.default_service_name)
+
             except Exception as e:
                 self._logger.error("Unable to create client service: %s", e)
                 self._valid = False
@@ -283,7 +340,9 @@ class SpotWrapper():
             self._side_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("side_image", 0.0)), self._callbacks.get("side_image", lambda:None), self._side_image_requests)
             self._rear_image_task = AsyncImageService(self._image_client, self._logger, max(0.0, self._rates.get("rear_image", 0.0)), self._callbacks.get("rear_image", lambda:None), self._rear_image_requests)
             self._idle_task = AsyncIdle(self._robot_command_client, self._logger, 10.0, self)
+            #self._choreography_task = Async
 
+            
             self._estop_endpoint = None
 
             self._async_tasks = AsyncTasks(
@@ -414,13 +473,22 @@ class SpotWrapper():
         """
         try:
             if severe:
-                self._estop_endpoint.stop()
+                self._estop_keepalive.stop()
             else:
-                self._estop_endpoint.settle_then_cut()
+                self._estop_keepalive.settle_then_cut()
 
             return True, "Success"
         except:
             return False, "Error"
+
+    def disengageEStop(self):
+        """Disengages the E-Stop"""
+        try:
+            self._estop_keepalive.allow()
+            return True, "Success"
+        except:
+            return False, "Error"
+
 
     def releaseEStop(self):
         """Stop eStop keepalive"""
@@ -445,7 +513,8 @@ class SpotWrapper():
         try:
             self.releaseLease()
             self.releaseEStop()
-            return True, "Success"
+            return True, "Success"      
+            
         except Exception as e:
             return False, str(e)
 
@@ -456,6 +525,26 @@ class SpotWrapper():
         self.releaseLease()
         self.releaseEStop()
 
+    def _robot_command_async(self, command_proto, end_time_secs=None, timesync_endpoint=None):
+        """Generic blocking function for sending commands to robots.
+
+        Args:
+            command_proto: robot_command_pb2 object to send to the robot.  Usually made with RobotCommandBuilder
+            end_time_secs: (optional) Time-to-live for the command in seconds
+            timesync_endpoint: (optional) Time sync endpoint
+        """
+        #self._lease_client.acquire()
+        print("robot command", self._lease_client.list_leases())
+
+        try:
+            ids = self._robot_command_client.robot_command_async(lease=None, command=command_proto, end_time_secs=end_time_secs, timesync_endpoint=timesync_endpoint)
+            
+            print("robot ids", ids)
+            return True, "Success", id
+        except Exception as e:
+            return False, str(e), None
+
+
     def _robot_command(self, command_proto, end_time_secs=None, timesync_endpoint=None):
         """Generic blocking function for sending commands to robots.
 
@@ -464,8 +553,13 @@ class SpotWrapper():
             end_time_secs: (optional) Time-to-live for the command in seconds
             timesync_endpoint: (optional) Time sync endpoint
         """
+        #self._lease_client.acquire()
+        print("robot command", self._lease_client.list_leases())
+
         try:
             id = self._robot_command_client.robot_command(lease=None, command=command_proto, end_time_secs=end_time_secs, timesync_endpoint=timesync_endpoint)
+            
+            print("robot id", id)
             return True, "Success", id
         except Exception as e:
             return False, str(e), None
@@ -488,7 +582,7 @@ class SpotWrapper():
 
     def stand(self, monitor_command=True):
         """If the e-stop is enabled, and the motor power is enabled, stand the robot up."""
-        response = self._robot_command(RobotCommandBuilder.synchro_stand_command(params=self._mobility_params))
+        response = self._robot_command(RobotCommandBuilder.synchro_stand_command()) #params=self._mobility_params))
         if monitor_command:
             self._last_stand_command = response[2]
         return response[0], response[1]
@@ -540,6 +634,7 @@ class SpotWrapper():
         response = self._robot_command(RobotCommandBuilder.synchro_velocity_command(
                                       v_x=v_x, v_y=v_y, v_rot=v_rot, params=self._mobility_params),
                                       end_time_secs=end_time, timesync_endpoint=self._robot.time_sync.endpoint)
+        print("vel command", response)
         self._last_velocity_command_time = end_time
         return response[0], response[1]
 
@@ -589,6 +684,96 @@ class SpotWrapper():
         if response[0]:
             self._last_trajectory_command = response[2]
         return response[0], response[1]
+
+
+    # ------- YEJIN ADD -----
+    def battery_change_pose(self):
+        response = self._robot_command(
+            #'battery_change_pose',
+            RobotCommandBuilder.battery_change_pose_command(dir_hint=
+            basic_command_pb2.BatteryChangePoseCommand.Request.HINT_RIGHT))
+        return response[0], response[1]
+    
+    def _play_next_choreograph(self):
+        #self._Count_DANCE %= 16
+        print(self._Count_DANCE, " dance move")
+        #self._lease_wallet.get_lease()
+        #print(self._lease_wallet.get_lease_state())
+        #self._lease_client.acquire()
+        print("choreo", self._lease_client.list_leases())
+
+
+        if self._Count_DANCE==1 or self._Count_DANCE >=11:
+            _filename = CHOREO_DANCE[self._Count_DANCE]
+            filename = os.path.join(CHOREO_PATH, _filename)
+        
+            # load choreograph
+            print("File name: ", filename)
+            
+            choreography = load_choreography_sequence_from_txt_file(filename)
+            #print(choreography)
+            
+            try:
+                upload_response = self._choreography_client.upload_choreography(choreography, non_strict_parsing=True)
+            except UnauthenticatedError as err:
+                print("The robot license must contain 'choreography' permissions to upload and execute dances. "
+                    "Please contact Boston Dynamics Support to get the appropriate license file. ")
+            except ResponseError as err:
+                # Check if the ChoreographyService considers the uploaded routine as valid. If not, then the warnings must be
+                # addressed before the routine can be executed on robot.
+                error_msg = "Choreography sequence upload failed. The following warnings were produced: "
+                for warn in err.response.warnings:
+                    error_msg += warn
+                print(error_msg)
+
+
+            # First, get the name of the choreographed sequence that was uploaded to the robot to uniquely identify which
+            # routine to perform.
+            routine_name = choreography.name
+            # Then, set a start time five seconds after the current time.
+            client_start_time = time.time() + 1.0
+            # Specify the starting slice of the choreography. We will set this to slice=0 so that the routine begins at
+            # the very beginning.
+            start_slice = 0
+            print(routine_name, client_start_time)
+
+            try:
+            # Issue the command to the robot's choreography service.
+                res=self._choreography_client.execute_choreography(choreography_name=routine_name,
+                                                    client_start_time=client_start_time,
+                                                    choreography_starting_slice=start_slice)
+                print(res)
+            except Exception as e:
+                print("failed to execute",e)
+            
+            # Estimate how long the choreographed sequence will take, and sleep that long.
+            total_choreography_slices = 0
+            for move in choreography.moves:
+                total_choreography_slices += move.requested_slices
+            print(total_choreography_slices)
+            estimated_time_seconds = total_choreography_slices / choreography.slices_per_minute * 60.0
+            time.sleep(estimated_time_seconds)
+                 
+                        
+            self._Count_DANCE+=1
+            #self.releaseLease()
+            return True, "Success"
+
+
+        elif self._Count_DANCE>1 and self._Count_DANCE < 11:
+            #self.getLease()
+            _filename = ROSBAG_DANCE[self._Count_DANCE]
+            filename = os.path.join(ROSBAG_PATH, _filename)
+            player = subprocess.Popen(['rosbag','play',_filename],cwd=ROSBAG_PATH)
+            self._Count_DANCE+=1
+            #self.releaseLease()
+            return True, "Success"
+
+            
+
+
+    # ------ MODE ---------
+
 
     def list_graph(self, upload_path):
         """List waypoint ids of garph_nav

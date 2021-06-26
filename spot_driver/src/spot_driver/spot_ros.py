@@ -231,6 +231,17 @@ class SpotROS():
             self.populate_camera_static_transforms(data[0])
             self.populate_camera_static_transforms(data[1])
 
+    # --- YEJIN -----
+    def handle_choreograph_play_next(self, req):
+        resp = self.spot_wrapper._play_next_choreograph()
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_battery_pose(self, req):
+        resp = self.spot_wrapper.battery_change_pose()
+        return TriggerResponse(resp[0], resp[1])
+    # --- YEJIN -----
+
+
     def handle_claim(self, req):
         """ROS service handler for the claim service"""
         resp = self.spot_wrapper.claim()
@@ -279,6 +290,11 @@ class SpotROS():
     def handle_estop_soft(self, req):
         """ROS service handler to soft-eStop the robot.  The robot will try to settle on the ground before cutting power to the motors"""
         resp = self.spot_wrapper.assertEStop(False)
+        return TriggerResponse(resp[0], resp[1])
+
+    def handle_estop_disengage(self, req):
+        """ROS service handler to disengage the eStop on the robot."""
+        resp = self.spot_wrapper.disengageEStop()
         return TriggerResponse(resp[0], resp[1])
 
     def handle_clear_bahavior_fault(self, req):
@@ -379,6 +395,8 @@ class SpotROS():
         mobility_params = self.spot_wrapper.get_mobility_params()
         mobility_params.body_control.CopyFrom(body_control)
         self.spot_wrapper.set_mobility_params(mobility_params)
+        self.spot_wrapper.stand(params=self._mobility_params)
+        #self.spot_wrapper.body_pose_cmd()_robot_command
 
     def handle_list_graph(self, upload_path):
         """ROS service handler for listing graph_nav waypoint_ids"""
@@ -534,6 +552,12 @@ class SpotROS():
             rospy.Subscriber('cmd_vel', Twist, self.cmdVelCallback, queue_size = 1)
             rospy.Subscriber('body_pose', Pose, self.bodyPoseCallback, queue_size = 1)
 
+            # ------ ADD by Yejin --------
+            rospy.Service("battery_change_pose", Trigger, self.handle_battery_pose)
+            rospy.Service("choreography", Trigger, self.handle_choreograph_play_next)
+            # ------------------------------
+
+
             rospy.Service("claim", Trigger, self.handle_claim)
             rospy.Service("release", Trigger, self.handle_release)
             rospy.Service("stop", Trigger, self.handle_stop)
@@ -545,6 +569,8 @@ class SpotROS():
 
             rospy.Service("estop/hard", Trigger, self.handle_estop_hard)
             rospy.Service("estop/gentle", Trigger, self.handle_estop_soft)
+            rospy.Service("estop/release", Trigger, self.handle_estop_disengage)
+
 
             rospy.Service("stair_mode", SetBool, self.handle_stair_mode)
             rospy.Service("locomotion_mode", SetLocomotion, self.handle_locomotion_mode)
